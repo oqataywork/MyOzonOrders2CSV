@@ -9,6 +9,8 @@
   let running = false;
   let stopRequested = false;
   let lastMessage = '';
+  let exportProgress = { phase: 'idle', current: 0, total: 0 };
+  let partialDecision = null;
   let diagnostics = null;
   const activeControllers = new Set();
   let detailPreparationPromise = null;
@@ -38,12 +40,24 @@
     }
 
     if (message?.type === 'OZON_EXPORT_STATUS') {
-      sendResponse({ running, lastMessage });
+      sendResponse({ running, lastMessage, progress: exportProgress, version: chrome.runtime.getManifest().version });
+      return;
+    }
+
+    if (message?.type === 'OZON_PARTIAL_EXPORT_DECISION') {
+      if (!partialDecision || exportProgress.phase !== 'awaiting-choice') {
+        sendResponse({ ok: false, error: 'Нет результата, ожидающего сохранения.' });
+        return;
+      }
+      partialDecision(message.download === true);
+      sendResponse({ ok: true });
       return;
     }
 
     if (message?.type === 'OZON_STOP_EXPORT') {
+      if (!running) { sendResponse({ ok: true }); return; }
       stopRequested = true;
+      exportProgress.phase = 'stopping';
       addDiagnostic('info', 'Получена команда остановки');
       activeControllers.forEach((controller) => controller.abort());
       chrome.runtime.sendMessage({ type: 'OZON_ABORT_DETAIL_TABS' }).catch(() => {});
@@ -60,15 +74,19 @@
 
     running = true;
     stopRequested = false;
+    partialDecision = null;
+    exportProgress = { phase: 'collecting', current: 0, total: 0, startedAt: Date.now() };
     startDiagnostics(message.options || {});
     runExport(message.options || {})
       .catch((error) => {
+        exportProgress.phase = 'error';
         addDiagnostic('error', 'Необработанная ошибка выгрузки', { error: error.message, stack: error.stack || '' });
         updateOverlay(`Ошибка: ${error.message}`, true);
       })
       .finally(() => {
         running = false;
         stopRequested = false;
+        exportProgress.finishedAt = Date.now();
       });
     sendResponse({ ok: true });
   });
@@ -156,6 +174,7 @@
     }
 
     if (!baseRows.length) {
+      exportProgress.phase = 'empty';
       updateOverlay(singleOrderMode
         ? 'Не удалось подготовить указанный заказ.'
         : 'Заказы не найдены. Прокрутите страницу вручную и повторите экспорт.', true);
@@ -173,6 +192,7 @@
       return;
     }
     if (!result.rows.length) {
+      exportProgress.phase = 'empty';
       updateOverlay(singleOrderMode
         ? `Заказ ${singleOrder.orderNumber} не дал строк для CSV после применения правил возврата.`
         : 'По выбранному периоду после исключения отмен и возвратов заказов не найдено.', true);
@@ -194,7 +214,11 @@
       cacheWrites: result.cacheWrites,
       stopReason
     });
+    exportProgress.phase = 'saving';
+    updateOverlay('Выберите, куда сохранить CSV. Ожидаем подтверждения сохранения…');
     await downloadCsv(csv, buildExportFilename(runOptions));
+    exportProgress.phase = 'completed';
+    exportProgress.summary = { orders: result.orders, rows: result.rows.length };
 
     updateOverlay(
       singleOrderMode
@@ -245,6 +269,7 @@
     let cacheHits = 0;
     let cacheWrites = 0;
     const totalEntries = entries.length;
+    exportProgress = { ...exportProgress, phase: 'details', current: 0, total: totalEntries };
 
     // Ozon mixes dates in the order list, so every loaded non-cancelled card must
     // be checked within the history loaded up to the date boundary or list end.
@@ -257,6 +282,7 @@
       if ((options.dateFrom && baseDate && baseDate < options.dateFrom) ||
           (options.dateTo && baseDate && baseDate > options.dateTo)) {
         processed += 1;
+        exportProgress.current = processed;
         updateOverlay(`Получаю состав заказов: проверено ${processed} из ${totalEntries}, вне периода`);
         return;
       }
@@ -302,6 +328,8 @@
 
       const resolvedDate = detail?.orderDate || baseDate;
       processed += 1;
+      exportProgress.current = processed;
+      if (stopRequested) return;
       updateOverlay(
         `Получаю состав заказов: проверено ${processed} из ${totalEntries}${fromCache ? ', из кэша' : ''}${resolvedDate ? `, дата ${resolvedDate}` : ''}`
       );
@@ -428,6 +456,7 @@
   }
 
   async function fetchOrderDetail(orderUrl, options) {
+    if (stopRequested) return null;
     const safeUrl = OzonSecurity.orderUrl(orderUrl, location.origin);
     if (!safeUrl) {
       addDiagnostic('warning', 'Заблокирована недопустимая ссылка на заказ');
@@ -459,6 +488,7 @@
       // Если фоновая вкладка недоступна, ниже используются запросы страницы.
     }
 
+    if (stopRequested) return null;
     let composerDetail = null;
     try {
       const parsedUrl = new URL(orderUrl);
@@ -1622,6 +1652,7 @@
   }
 
   function offerStoppedExport(rows, stage, summary = {}) {
+    exportProgress.phase = 'awaiting-choice';
     addDiagnostic('info', 'Выгрузка остановлена пользователем', { stage, partialRows: rows.length });
     return new Promise((resolve) => {
       const overlay = document.getElementById(OVERLAY_ID) || createOverlay();
@@ -1634,6 +1665,8 @@
       actions.hidden = false;
 
       const finish = async (download) => {
+        if (exportProgress.phase !== 'awaiting-choice') return;
+        exportProgress.phase = 'saving';
         actions.hidden = true;
         try {
         const day = new Date().toISOString().slice(0, 10);
@@ -1661,16 +1694,21 @@
         }
         actions.hidden = true;
         stop.style.display = '';
+        exportProgress.phase = 'stopped';
+        partialDecision = null;
         updateOverlay(download
           ? `Выгрузка остановлена. Скачаны частичный CSV (${rows.length} строк) и отчёт.`
           : 'Выгрузка остановлена. Файлы не созданы.');
         resolve();
         } catch (error) {
+          exportProgress.phase = 'awaiting-choice';
           updateOverlay(`Не удалось сохранить файлы: ${error.message}`, true);
           actions.hidden = false;
           stop.style.display = 'none';
         }
       };
+
+      partialDecision = finish;
 
       actions.querySelector('[data-download-partial]').onclick = () => finish(true);
       actions.querySelector('[data-discard-partial]').onclick = () => finish(false);
@@ -1683,12 +1721,14 @@
     overlay.id = OVERLAY_ID;
     overlay.style.cssText = [
       'position:fixed', 'right:20px', 'bottom:20px', 'z-index:2147483647',
-      'max-width:380px', 'padding:14px 42px 14px 16px', 'border-radius:12px',
-      'background:#111827', 'color:#fff', 'box-shadow:0 8px 30px #0005',
-      'font:14px/1.4 Arial,sans-serif'
+      'max-width:340px', 'padding:16px 40px 16px 18px', 'border-radius:16px',
+      'background:#172c49', 'color:#fff', 'box-shadow:0 8px 32px #13274635',
+      'font:13px/1.5 Segoe UI,Arial,sans-serif'
     ].join(';');
     overlay.innerHTML = [
-      '<span data-status>Подготовка…</span>',
+      '<div style="font-size:10px;letter-spacing:.08em;color:#a9c8ff;margin-bottom:7px">ЗАКАЗЫ OZON · CSV</div>',
+      '<span data-status role="status" aria-live="polite">Подготовка…</span>',
+      '<progress data-progress aria-label="Обработка заказов" style="width:100%;height:5px;accent-color:#80b1ff;margin-top:10px" hidden></progress>',
       '<div data-keep-tab>Не закрывайте эту вкладку с заказами до завершения выгрузки.</div>',
       '<button data-stop type="button">Стоп</button>',
       '<div data-partial-actions hidden>',
@@ -1699,7 +1739,7 @@
     ].join('');
     const stop = overlay.querySelector('[data-stop]');
     const keepTab = overlay.querySelector('[data-keep-tab]');
-    keepTab.style.cssText = 'margin-top:7px;color:#fde68a;font-size:12px;font-weight:700';
+    keepTab.style.cssText = 'margin-top:9px;color:#adc0da;font-size:11px';
     stop.style.cssText = 'margin-left:12px;padding:5px 9px;border:0;border-radius:7px;background:#dc2626;color:#fff;font-weight:700;cursor:pointer';
     stop.addEventListener('click', () => {
       if (stop.dataset.mode === 'exit') {
@@ -1707,13 +1747,14 @@
         return;
       }
       stopRequested = true;
+      exportProgress.phase = 'stopping';
       activeControllers.forEach((controller) => controller.abort());
       chrome.runtime.sendMessage({ type: 'OZON_ABORT_DETAIL_TABS' }).catch(() => {});
       updateOverlay('Останавливаю выгрузку…');
       stop.disabled = true;
     });
     const partialActions = overlay.querySelector('[data-partial-actions]');
-    partialActions.style.cssText = 'margin-top:10px;display:flex;gap:8px;flex-wrap:wrap';
+    partialActions.style.cssText = 'margin-top:10px';
     const downloadPartial = overlay.querySelector('[data-download-partial]');
     downloadPartial.style.cssText = 'padding:7px 10px;border:0;border-radius:7px;background:#16a34a;color:#fff;font-weight:700;cursor:pointer';
     const discardPartial = overlay.querySelector('[data-discard-partial]');
@@ -1730,15 +1771,22 @@
 
   function updateOverlay(text, error = false) {
     lastMessage = text;
+    if (error && !['empty', 'awaiting-choice'].includes(exportProgress.phase)) exportProgress.phase = 'error';
     const overlay = document.getElementById(OVERLAY_ID);
     if (!overlay) return;
-    overlay.style.background = error ? '#991b1b' : '#111827';
+    overlay.style.background = error ? '#702d35' : '#172c49';
     overlay.querySelector('[data-status]').textContent = text;
     const stop = overlay.querySelector('[data-stop]');
-    const finished = /^(?:Готово:|Ошибка:|Выгрузка остановлена|Заказы не найдены|По выбранному периоду|Откройте раздел)/i.test(text);
-    stop.textContent = finished ? 'Выйти' : 'Стоп';
+    const finished = ['completed', 'stopped', 'error', 'empty'].includes(exportProgress.phase);
+    const progress = overlay.querySelector('[data-progress]');
+    progress.hidden = finished || exportProgress.phase === 'awaiting-choice';
+    if (exportProgress.total > 0 && exportProgress.phase === 'details') {
+      progress.max = exportProgress.total; progress.value = exportProgress.current;
+    } else progress.removeAttribute('value');
+    overlay.querySelector('[data-keep-tab]').hidden = finished;
+    stop.textContent = finished ? 'Закрыть' : 'Остановить';
     stop.dataset.mode = finished ? 'exit' : 'stop';
-    stop.disabled = false;
+    stop.disabled = ['stopping', 'saving'].includes(exportProgress.phase);
   }
 
   function absoluteUrl(href) {

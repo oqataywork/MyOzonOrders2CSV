@@ -35,6 +35,7 @@ function environment() {
     window: { addEventListener() {} },
     document: { getElementById: () => null },
     chrome: {
+      action: { onClicked: { addListener() {} } },
       runtime: {
         getManifest: () => JSON.parse(source('manifest.json')),
         onMessage: { addListener() {} },
@@ -201,7 +202,7 @@ function background(detail = { products: [{ product: 'Тестовый това�
     },
     onUpdated: { addListener() {}, removeListener() {} },
   };
-  env.context.importScripts = (file) => vm.runInContext(source(file), env.context);
+  env.context.importScripts = (...files) => files.forEach((file) => vm.runInContext(source(file), env.context));
   vm.runInContext(source('background.js'), env.context);
   return { ...env, calls };
 }
@@ -289,7 +290,9 @@ test('cache period restrictions remain enforced when saving is enabled', async (
 
 test('manifest and popup load the shared guard and retain only required permissions', () => {
   const manifest = JSON.parse(source('manifest.json'));
-  assert.deepEqual(manifest.permissions, ['storage', 'downloads']);
+  assert.deepEqual(manifest.permissions, ['storage', 'downloads', 'sidePanel']);
+  assert.equal(manifest.side_panel.default_path, 'popup.html');
+  assert.equal(manifest.action.default_popup, undefined);
   assert.deepEqual(manifest.host_permissions, ['https://ozon.ru/*', 'https://www.ozon.ru/*']);
   assert.deepEqual(manifest.content_scripts[0].matches, manifest.host_permissions);
   assert.equal(manifest.content_scripts[0].js[0], 'security.js');

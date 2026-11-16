@@ -3,95 +3,85 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>OzonMyOrders2csv</title>
+  <title>Заказы Ozon · CSV</title>
   <link rel="stylesheet" href="popup.css">
 </head>
 <body>
   <main>
-    <h1>OzonMyOrders2csv <span id="version" class="version"></span></h1>
-    <p class="hint">Для периода откройте Ozon «Заказы». Для одного заказа укажите его номер или ссылку.</p>
+    <header class="app-header">
+      <div class="brand-mark" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 4h10l4 4v12H5zM14 4v5h5M8 13h8M8 16h5"/></svg></div>
+      <div><p class="eyebrow">ПОКУПКИ ПОД КОНТРОЛЕМ</p><h1>Заказы Ozon <span>в CSV</span></h1></div>
+      <span id="version" class="version"></span>
+    </header>
 
-    <div class="settings-grid">
-      <section class="settings-column" aria-labelledby="exportSettingsTitle">
-        <h2 id="exportSettingsTitle">Параметры выгрузки</h2>
-        <div class="date-grid">
-          <label>
-            Период
-            <select id="periodPreset">
-              <option value="custom">Свои даты</option>
-              <option value="year">Год</option>
-            </select>
-          </label>
-          <label>
-            Год
-            <select id="presetYear" disabled></select>
-          </label>
+    <section class="connection" aria-label="Подключение к Ozon">
+      <span id="connectionDot" class="dot" aria-hidden="true"></span>
+      <div><strong id="connectionTitle">Открываем архив заказов</strong><p id="connectionHint">Подключаемся к вашей вкладке Ozon…</p></div>
+      <button id="openOrders" class="icon-button" type="button" title="Перейти к архиву заказов" aria-label="Открыть архив заказов">↗</button>
+    </section>
+
+    <form id="exportForm" novalidate>
+      <fieldset id="settings" disabled>
+        <legend class="sr-only">Параметры выгрузки</legend>
+        <div class="mode-switch" role="group" aria-label="Что выгрузить">
+          <button id="periodMode" type="button" aria-pressed="true">За период</button>
+          <button id="orderMode" type="button" aria-pressed="false">Один заказ</button>
         </div>
-        <div class="date-grid">
-          <label>
-            Дата от
-            <input id="dateFrom" type="date">
-          </label>
-          <label>
-            Дата до
-            <input id="dateTo" type="date">
-          </label>
-        </div>
-        <label>
-          Конкретный заказ
-          <input id="specificOrder" type="text" inputmode="text" placeholder="34475857-0960 или ссылка Ozon">
-          <span class="field-note">Если заполнено, даты и прокрутка списка не используются.</span>
-        </label>
-        <label class="check">
-          <input id="autoScroll" type="checkbox" checked>
-          Автоматически загрузить старые заказы
-        </label>
-      </section>
 
-      <section class="settings-column" aria-labelledby="generalSettingsTitle">
-        <h2 id="generalSettingsTitle">Настройки</h2>
-        <p class="rule">Отменённые исключаются. Возвращённые по умолчанию не выгружаются.</p>
-        <label class="check observer-option">
-          <input id="includeReturned" type="checkbox">
-          <span class="check-copy">
-            Включать товары с заявкой на возврат
-            <span class="field-note">Останутся в CSV со статусом.</span>
-          </span>
-        </label>
-        <label class="check observer-option">
-          <input id="showTabs" type="checkbox">
-          <span class="check-copy">
-            Показывать вкладки при обработке
-            <span class="field-note">Для визуальной проверки.</span>
-          </span>
-        </label>
-        <label class="check observer-option cache-option">
-          <input id="useCache" type="checkbox">
-          <span class="check-copy">
-            Использовать и сохранять кэш
-            <span class="field-note">Если снять — заказы не читаются из кэша и не сохраняются. Старый кэш удаляется кнопкой «Очистить».</span>
-          </span>
-        </label>
-
-        <section class="cache-panel" aria-labelledby="cacheTitle">
-          <div id="cacheTitle" class="cache-title">Кэш закрытых заказов</div>
-          <div id="cacheInfo" class="cache-info">Проверяю кэш…</div>
-          <div class="cache-actions">
-            <button id="downloadCache" class="cache-download" type="button">Скачать JSON</button>
-            <button id="clearCache" class="cache-clear" type="button">Очистить</button>
+        <section id="periodFields" class="card" aria-labelledby="periodTitle">
+          <div class="section-heading"><h2 id="periodTitle">Период покупок</h2><span id="periodBadge" class="badge">Последний месяц</span></div>
+          <div class="presets" role="group" aria-label="Быстрый выбор периода">
+            <button type="button" data-preset="week" aria-pressed="false">Неделя</button>
+            <button type="button" data-preset="lastMonth" aria-pressed="true">Месяц</button>
+            <button type="button" data-preset="year" aria-pressed="false">Год</button>
+            <button type="button" data-preset="all" aria-pressed="false">Всё время</button>
           </div>
+          <label id="yearField" hidden>Год<select id="presetYear"></select></label>
+          <div class="date-grid">
+            <label>С даты<input id="dateFrom" type="date" aria-describedby="rangeHint"></label>
+            <label>По дату<input id="dateTo" type="date" aria-describedby="rangeHint"></label>
+          </div>
+          <p id="rangeHint" class="hint">Даты включаются в выгрузку.</p>
         </section>
-      </section>
-    </div>
 
-    <div class="actions">
-      <button id="exportButton" type="button">Выгрузить в CSV</button>
-      <button id="stopButton" class="stop" type="button">Стоп</button>
-    </div>
-    <p id="message" class="message" aria-live="polite"></p>
-    <p class="privacy">Файл создаётся локально. При включённом кэше история покупок сохраняется в этом профиле Chrome.</p>
+        <section id="orderFields" class="card" hidden aria-labelledby="orderTitle">
+          <h2 id="orderTitle">Конкретный заказ</h2>
+          <label>Номер или ссылка<input id="specificOrder" type="text" placeholder="12345678-0001" autocomplete="off" spellcheck="false"></label>
+          <p class="hint">Состав, цены и возвраты одного заказа. Период не применяется.</p>
+        </section>
+
+        <details class="card options">
+          <summary>Настройки выгрузки <span class="summary-note">Возвраты, вкладки, кэш</span></summary>
+          <label class="check"><input id="autoScroll" type="checkbox" checked><span>Загрузить всю историю за период<small>Автоматически прокрутить список заказов.</small></span></label>
+          <label class="check"><input id="includeReturned" type="checkbox"><span>Включить товары с заявкой на возврат<small>Сохранить в CSV с отметкой о возврате.</small></span></label>
+          <label class="check"><input id="showTabs" type="checkbox"><span>Показывать обработку заказов<small>Открывать заказы по одному на экране.</small></span></label>
+          <label class="check"><input id="useCache" type="checkbox"><span>Использовать и сохранять кэш<small>Хранить закрытые заказы в этом профиле Chrome.</small></span></label>
+          <div class="cache-panel">
+            <p id="cacheInfo" class="hint">Кэш пуст</p>
+            <div class="cache-actions"><button id="downloadCache" class="text-button" type="button" disabled>Скачать JSON</button><button id="clearCache" class="text-button danger-text" type="button" disabled>Очистить кэш</button></div>
+            <p class="hint small">Выключение кэша останавливает чтение и запись. Старые записи удаляются кнопкой «Очистить».</p>
+          </div>
+        </details>
+      </fieldset>
+
+      <section id="statusCard" class="status-card" data-state="idle" aria-labelledby="statusTitle">
+        <div class="status-heading"><h2 id="statusTitle">Всё готово к выгрузке</h2><span id="elapsed" class="muted"></span></div>
+        <p id="statusDetail" class="hint">Выберите период и сохраните покупки в таблицу.</p>
+        <progress id="progress" aria-label="Обработка заказов" hidden></progress>
+        <div id="resultStats" class="result-stats" hidden><div><strong id="ordersCount">0</strong><span>заказов</span></div><div><strong id="rowsCount">0</strong><span>строк товаров</span></div></div>
+        <div id="partialActions" class="partial-actions" hidden><button id="savePartial" type="button" class="secondary">Сохранить собранное</button><button id="discardPartial" type="button" class="text-button">Завершить без файлов</button></div>
+      </section>
+
+      <footer class="action-footer">
+        <p id="message" class="message" role="status" aria-live="polite"></p>
+        <button id="exportButton" class="primary" type="submit" disabled><span id="exportLabel">Скачать CSV</span><span aria-hidden="true">↓</span></button>
+        <button id="stopButton" class="stop-button" type="button" hidden>Остановить выгрузку</button>
+        <p class="privacy">Для Excel · CSV с защитой формул · Файл сохраняется на ваш компьютер</p>
+      </footer>
+    </form>
   </main>
   <script src="security.js"></script>
+  <script src="ui-model.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

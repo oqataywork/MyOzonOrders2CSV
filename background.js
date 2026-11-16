@@ -1,11 +1,23 @@
-importScripts('security.js');
+importScripts('security.js', 'navigation.js');
 
-const detailTabs = new Set();
+chrome.action.onClicked.addListener((tab) => {
+  // Call open synchronously in the user gesture, before any awaited work.
+  chrome.sidePanel.open({ windowId: tab.windowId }).catch(console.error);
+  OzonNavigation.ensureArchiveTab(tab.windowId).catch(console.error);
+});
+
+const detailTabs = new Map();
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === 'OZON_ENSURE_ORDERS_TAB') {
+    OzonNavigation.ensureArchiveTab(message.windowId, message.activate !== false)
+      .then((result) => sendResponse({ ok: true, ...result }))
+      .catch((error) => sendResponse({ ok: false, error: error.message }));
+    return true;
+  }
   if (message?.type === 'OZON_ABORT_DETAIL_TABS') {
-    const ids = [...detailTabs];
-    detailTabs.clear();
+    const ids = [...detailTabs].filter(([, source]) => source === sender.tab?.id).map(([id]) => id);
+    ids.forEach((id) => detailTabs.delete(id));
     if (ids.length) chrome.tabs.remove(ids).catch(() => {});
     sendResponse({ ok: true });
     return;
@@ -30,7 +42,7 @@ async function parseDetailInTab(url, options, sourceTabId) {
   if (!safeOrderUrl) throw new Error('Заблокирована ссылка: требуется HTTPS-страница заказа на ozon.ru или www.ozon.ru');
   const showTabs = Boolean(options.showTabs);
   const tab = await chrome.tabs.create({ url: safeOrderUrl.href, active: showTabs });
-  detailTabs.add(tab.id);
+  detailTabs.set(tab.id, sourceTabId);
   try {
     await waitForComplete(tab.id, 20000);
     await assertTabUrl(tab.id, OzonSecurity.orderUrl);

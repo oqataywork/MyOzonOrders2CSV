@@ -2,12 +2,12 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $distRoot = Join-Path $repoRoot 'dist'
 $extensionRoot = Join-Path $distRoot 'OzonMyOrders2csv'
-$files = @('manifest.json', 'security.js', 'background.js', 'content.js',
+$files = @('manifest.json', 'security.js', 'navigation.js', 'ui-model.js', 'background.js', 'content.js',
     'return-tools.js', 'popup.js', 'popup.html', 'popup.css',
     'README.md', 'README.txt', 'SECURITY-REVIEW.md')
 $manifest = Get-Content -Raw -Encoding UTF8 -LiteralPath (Join-Path $repoRoot 'manifest.json') | ConvertFrom-Json
 $version = $manifest.version_name
-if ($version -notmatch '^\d+\.\d+\.\d+-security\.\d+$') { throw 'Unexpected release version' }
+if ($version -notmatch '^\d+\.\d+\.\d+(?:-security\.\d+)?$') { throw 'Unexpected release version' }
 
 New-Item -ItemType Directory -Path $extensionRoot -Force | Out-Null
 # Refuse to package stray files or user data from an existing output directory.

@@ -1,327 +1,288 @@
-const button = document.querySelector('#exportButton');
-const stopButton = document.querySelector('#stopButton');
-const message = document.querySelector('#message');
-const autoScroll = document.querySelector('#autoScroll');
-const showTabs = document.querySelector('#showTabs');
-const includeReturned = document.querySelector('#includeReturned');
-const useCache = document.querySelector('#useCache');
-const dateFrom = document.querySelector('#dateFrom');
-const dateTo = document.querySelector('#dateTo');
-const periodPreset = document.querySelector('#periodPreset');
-const presetYear = document.querySelector('#presetYear');
-const specificOrder = document.querySelector('#specificOrder');
-const cacheInfo = document.querySelector('#cacheInfo');
-const downloadCache = document.querySelector('#downloadCache');
-const clearCache = document.querySelector('#clearCache');
+'use strict';
+const $ = (id) => document.getElementById(id);
 const CACHE_PREFIX = 'obo-order-cache-v4:';
-document.querySelector('#version').textContent = `v${chrome.runtime.getManifest().version}`;
-let monitorTimer = null;
+const presets = { lastMonth: 'Последний месяц', week: 'Последние 7 дней', year: 'За год', all: 'Всё время', custom: 'Свои даты' };
+let selectedPreset = 'lastMonth';
+let mode = 'period';
+let sourceTabId = null;
+let connected = false;
+let connecting = false;
+let starting = false;
+let state = { running: false, progress: { phase: 'idle' } };
+let monitorTimer;
+let settingsReady = false;
+let cacheEntries = [];
 
-async function getCacheEntries() {
-  const stored = await chrome.storage.local.get(null);
-  return Object.entries(stored)
-    .filter(([key, value]) => key.startsWith(CACHE_PREFIX) && value?.detail?.products?.length)
-    .sort(([, left], [, right]) => String(left.orderNumber || '').localeCompare(String(right.orderNumber || '')));
+$('version').textContent = `v${chrome.runtime.getManifest().version}`;
+for (let year = new Date().getFullYear(); year >= 1998; year--) {
+  const option = document.createElement('option');
+  option.value = String(year); option.textContent = String(year);
+  $('presetYear').appendChild(option);
 }
 
-async function refreshCacheInfo() {
-  try {
-    const entries = await getCacheEntries();
-    const productCount = entries.reduce((sum, [, entry]) => sum + (entry.detail?.products?.length || 0), 0);
-    cacheInfo.textContent = `Заказов: ${entries.length}, товарных позиций: ${productCount}`;
-    downloadCache.disabled = entries.length === 0;
-    clearCache.disabled = entries.length === 0;
-  } catch (error) {
-    cacheInfo.textContent = `Не удалось прочитать кэш: ${error.message}`;
-    downloadCache.disabled = true;
-    clearCache.disabled = true;
+function notify(text = '', error = false) {
+  $('message').textContent = text;
+  $('message').classList.toggle('error', error);
+}
+
+function connection(title, hint, kind = '') {
+  $('connectionTitle').textContent = title;
+  $('connectionHint').textContent = hint;
+  $('connectionDot').className = `dot ${kind}`;
+}
+
+function applyPreset() {
+  if (selectedPreset !== 'custom') {
+    const range = OzonUi.periodRange(selectedPreset, new Date(), $('presetYear').value);
+    $('dateFrom').value = range.dateFrom; $('dateTo').value = range.dateTo;
   }
+  renderSettings();
 }
 
-function cacheFilename() {
-  const now = new Date();
-  const date = localIsoDate(now);
-  const time = [now.getHours(), now.getMinutes(), now.getSeconds()]
-    .map((value) => String(value).padStart(2, '0')).join('-');
-  return `ozon_order_cache_${date}_${time} (v${chrome.runtime.getManifest().version}).json`;
-}
-
-downloadCache.addEventListener('click', async () => {
-  try {
-    const entries = await getCacheEntries();
-    if (!entries.length) throw new Error('Кэш пока пуст');
-    const payload = {
-      format: 'OzonMyOrders2csv order cache',
-      cacheSchema: 4,
-      extensionVersion: chrome.runtime.getManifest().version,
-      exportedAt: new Date().toISOString(),
-      orders: entries.map(([key, entry]) => ({ cacheKey: key, ...entry }))
-    };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
-    const dataUrl = await blobToDataUrl(blob);
-    const response = await chrome.runtime.sendMessage({
-      type: 'OZON_DOWNLOAD_DATA_URL', dataUrl, filename: cacheFilename()
-    });
-    if (!response?.ok) throw new Error(response?.error || 'Не удалось сохранить кэш');
-    message.classList.remove('error');
-    message.textContent = `Кэш скачан: ${entries.length} заказов.`;
-  } catch (error) {
-    message.classList.add('error');
-    message.textContent = error.message;
+function renderSettings() {
+  const single = mode === 'order';
+  $('periodFields').hidden = single;
+  $('orderFields').hidden = !single;
+  $('periodMode').setAttribute('aria-pressed', String(!single));
+  $('orderMode').setAttribute('aria-pressed', String(single));
+  $('yearField').hidden = selectedPreset !== 'year';
+  $('autoScroll').disabled = single;
+  $('dateFrom').disabled = selectedPreset === 'all';
+  $('dateTo').disabled = selectedPreset === 'all';
+  $('periodBadge').textContent = presets[selectedPreset];
+  for (const button of document.querySelectorAll('[data-preset]')) {
+    button.setAttribute('aria-pressed', String(button.dataset.preset === selectedPreset));
   }
-});
+  $('rangeHint').textContent = selectedPreset === 'all'
+    ? 'Вся история до сегодня. Большой архив может обрабатываться несколько минут.'
+    : selectedPreset === 'lastMonth'
+      ? 'От этой даты месяц назад до сегодня. Период обновляется автоматически.'
+      : 'Обе даты включаются в выгрузку. Можно задать свой диапазон.';
+  $('exportLabel').textContent = starting ? 'Подключаемся…' : state.running ? 'Выгрузка выполняется…' : 'Скачать CSV';
+}
 
-function blobToDataUrl(blob) {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error || new Error('Не удалось подготовить файл для скачивания'));
-    reader.readAsDataURL(blob);
+async function saveSettings() {
+  await chrome.storage.local.set({
+    periodPreset: selectedPreset, presetYear: Number($('presetYear').value),
+    dateFrom: $('dateFrom').value, dateTo: $('dateTo').value,
+    autoScroll: $('autoScroll').checked, includeReturned: $('includeReturned').checked,
+    showTabs: $('showTabs').checked, useCache: $('useCache').checked,
   });
 }
-
-clearCache.addEventListener('click', async () => {
-  const entries = await getCacheEntries().catch(() => []);
-  if (!entries.length) return;
-  const confirmed = window.confirm(`Удалить кэш закрытых заказов (${entries.length})? Даты и остальные настройки сохранятся.`);
-  if (!confirmed) return;
-  try {
-    await chrome.storage.local.remove(entries.map(([key]) => key));
-    message.classList.remove('error');
-    message.textContent = `Кэш очищен: удалено заказов ${entries.length}.`;
-    await refreshCacheInfo();
-  } catch (error) {
-    message.classList.add('error');
-    message.textContent = `Не удалось очистить кэш: ${error.message}`;
-  }
-});
-
-function localIsoDate(date = new Date()) {
-  return [
-    date.getFullYear(),
-    String(date.getMonth() + 1).padStart(2, '0'),
-    String(date.getDate()).padStart(2, '0')
-  ].join('-');
-}
-
-// Years are generated at opening so the list stays current.
-for (let year = new Date().getFullYear(); year >= 1998; year -= 1) {
-  const option = document.createElement('option');
-  option.value = String(year);
-  option.textContent = String(year);
-  presetYear.appendChild(option);
-}
-
-function syncPeriodPreset() {
-  const year = dateFrom.value.slice(0, 4);
-  const fullYear = dateFrom.value === `${year}-01-01` && dateTo.value === `${year}-12-31` &&
-    [...presetYear.options].some((option) => option.value === year);
-  periodPreset.value = fullYear ? 'year' : 'custom';
-  if (fullYear) presetYear.value = year;
-  syncExportMode();
-}
-
-function applyPeriodPreset() {
-  if (periodPreset.value === 'year') {
-    dateFrom.value = `${presetYear.value}-01-01`;
-    dateTo.value = `${presetYear.value}-12-31`;
-  }
-  syncExportMode();
-  return saveSettings();
-}
-
-periodPreset.addEventListener('change', applyPeriodPreset);
-presetYear.addEventListener('change', applyPeriodPreset);
-
-if (!dateTo.value) dateTo.value = localIsoDate();
 
 async function restoreSettings() {
-  const saved = await chrome.storage.local.get(['dateFrom', 'dateTo', 'showTabs', 'includeReturned', 'useCache']);
-  if (Object.prototype.hasOwnProperty.call(saved, 'dateFrom')) dateFrom.value = saved.dateFrom;
-  if (Object.prototype.hasOwnProperty.call(saved, 'dateTo')) dateTo.value = saved.dateTo;
-  if (Object.prototype.hasOwnProperty.call(saved, 'showTabs')) showTabs.checked = Boolean(saved.showTabs);
-  if (Object.prototype.hasOwnProperty.call(saved, 'includeReturned')) includeReturned.checked = Boolean(saved.includeReturned);
-  if (Object.prototype.hasOwnProperty.call(saved, 'useCache')) useCache.checked = Boolean(saved.useCache);
-  syncPeriodPreset();
-}
-
-function saveSettings() {
-  return chrome.storage.local.set({
-    dateFrom: dateFrom.value,
-    dateTo: dateTo.value,
-    showTabs: showTabs.checked,
-    includeReturned: includeReturned.checked,
-    useCache: useCache.checked
-  });
-}
-
-for (const field of [dateFrom, dateTo]) {
-  field.addEventListener('change', () => {
-    syncPeriodPreset();
-    saveSettings();
-  });
-}
-showTabs.addEventListener('change', saveSettings);
-includeReturned.addEventListener('change', saveSettings);
-useCache.addEventListener('change', saveSettings);
-restoreSettings().catch(() => {});
-refreshCacheInfo();
-
-function syncExportMode() {
-  const singleOrderMode = Boolean(specificOrder.value.trim());
-  periodPreset.disabled = singleOrderMode;
-  presetYear.disabled = singleOrderMode || periodPreset.value !== 'year';
-  dateFrom.disabled = singleOrderMode;
-  dateTo.disabled = singleOrderMode;
-  autoScroll.disabled = singleOrderMode;
-}
-
-autoScroll.addEventListener('change', syncExportMode);
-specificOrder.addEventListener('input', syncExportMode);
-syncExportMode();
-
-function normalizeSpecificOrder(value) {
-  const raw = String(value || '').trim();
-  if (!raw) return { orderNumber: '', orderUrl: '' };
-
-  if (/^[\d-]{6,}$/.test(raw)) {
-    return {
-      orderNumber: raw,
-      orderUrl: `https://www.ozon.ru/my/orderdetails/?order=${encodeURIComponent(raw)}`
-    };
+  const saved = await chrome.storage.local.get(['periodPreset', 'presetYear', 'dateFrom', 'dateTo',
+    'autoScroll', 'includeReturned', 'showTabs', 'useCache']);
+  const period = OzonUi.initialPeriod(saved);
+  selectedPreset = period.preset;
+  $('dateFrom').value = period.dateFrom; $('dateTo').value = period.dateTo;
+  if ([...$('presetYear').options].some((option) => option.value === String(saved.presetYear))) {
+    $('presetYear').value = String(saved.presetYear);
   }
-
-  try {
-    const url = OzonSecurity.orderUrl(raw);
-    if (!url) throw new Error('not_ozon');
-    const orderNumber = url.searchParams.get('order') || url.searchParams.get('orderNumber') ||
-      url.searchParams.get('orderId') || url.pathname.match(/\/orderdetails\/(\d[\d-]{5,})/i)?.[1] || '';
-    if (!orderNumber || !/^[\d-]{6,}$/.test(orderNumber)) throw new Error('no_order');
-    return {
-      orderNumber,
-      orderUrl: `https://www.ozon.ru/my/orderdetails/?order=${encodeURIComponent(orderNumber)}`
-    };
-  } catch {
-    throw new Error('Укажите номер заказа Ozon, например 34475857-0960, или полную ссылку на заказ.');
+  for (const id of ['autoScroll', 'includeReturned', 'showTabs', 'useCache']) {
+    if (typeof saved[id] === 'boolean') $(id).checked = saved[id];
   }
+  settingsReady = true;
+  render();
 }
 
-async function getActiveOzonTab() {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.id || !OzonSecurity.ozonUrl(tab.url)) {
-    throw new Error('Сначала откройте любую страницу ozon.ru');
+function render() {
+  const progress = state.progress || { phase: 'idle' };
+  const phase = progress.phase;
+  const busy = starting || state.running;
+  $('settings').disabled = busy || !settingsReady;
+  $('exportButton').disabled = busy || !connected || !settingsReady;
+  $('stopButton').hidden = !state.running || ['awaiting-choice', 'saving', 'stopping'].includes(phase);
+  $('stopButton').disabled = !connected;
+  $('partialActions').hidden = phase !== 'awaiting-choice';
+  $('statusCard').dataset.state = phase;
+  const titles = { idle: 'Всё готово к выгрузке', collecting: 'Собираем историю заказов',
+    details: 'Проверяем состав и цены', saving: 'Сохраняем файл', completed: 'Выгрузка сохранена',
+    stopping: 'Останавливаем выгрузку', 'awaiting-choice': 'Сохранить частичный результат?',
+    stopped: 'Выгрузка остановлена', error: 'Не удалось завершить выгрузку', empty: 'Заказы не найдены' };
+  $('statusTitle').textContent = connecting ? 'Подключаемся к Ozon' : (titles[phase] || 'Подготавливаем выгрузку');
+  $('statusDetail').textContent = state.lastMessage || 'Выберите период и сохраните покупки в таблицу.';
+  $('progress').hidden = !state.running || phase === 'awaiting-choice';
+  if (progress.total > 0 && phase === 'details') {
+    $('progress').max = progress.total; $('progress').value = progress.current;
+  } else $('progress').removeAttribute('value');
+  const seconds = progress.startedAt ? Math.max(0, Math.floor(((progress.finishedAt || Date.now()) - progress.startedAt) / 1000)) : 0;
+  $('elapsed').textContent = progress.startedAt ? `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}` : '';
+  $('resultStats').hidden = !progress.summary;
+  if (progress.summary) {
+    $('ordersCount').textContent = progress.summary.orders;
+    $('rowsCount').textContent = progress.summary.rows;
   }
-  return tab;
-}
-
-function setRunningUi(running, statusText = '') {
-  button.disabled = running;
-  stopButton.disabled = false;
-  stopButton.textContent = running ? 'Стоп' : 'Выйти';
-  stopButton.dataset.mode = running ? 'stop' : 'exit';
-  if (statusText) message.textContent = statusText;
+  $('downloadCache').disabled = busy || !cacheEntries.length;
+  $('clearCache').disabled = busy || !cacheEntries.length;
+  renderSettings();
 }
 
 async function refreshStatus() {
-  try {
-    const tab = await getActiveOzonTab();
-    const response = await chrome.tabs.sendMessage(tab.id, { type: 'OZON_EXPORT_STATUS' });
-    setRunningUi(Boolean(response?.running), response?.lastMessage || '');
-    return Boolean(response?.running);
-  } catch {
-    stopButton.disabled = true;
-    return false;
+  const tab = await chrome.tabs.get(sourceTabId);
+  const url = OzonSecurity.ozonUrl(tab.url);
+  if (!url || !/^\/my\/orderlist\/?$/.test(url.pathname) || url.searchParams.get('selectedTab') !== 'archive') {
+    throw new Error('Вернитесь в архив заказов кнопкой ↗. Если Ozon просит войти — сначала войдите в аккаунт.');
   }
+  const next = await chrome.tabs.sendMessage(sourceTabId, { type: 'OZON_EXPORT_STATUS' });
+  if (typeof next?.running !== 'boolean') throw new Error('Страница заказов ещё не готова.');
+  const wasRunning = state.running;
+  state = next;
+  connected = true;
+  connection('Архив заказов открыт', 'Можно выгружать. Панель останется рядом.', 'ready');
+  render();
+  if (wasRunning && !state.running) await refreshCacheInfo().catch((error) => notify(`Не удалось обновить сведения о кэше: ${error.message}`, true));
+  return next;
 }
 
 function startMonitoring() {
-  clearInterval(monitorTimer);
-  monitorTimer = setInterval(async () => {
-    const running = await refreshStatus();
-    if (!running) clearInterval(monitorTimer);
-  }, 500);
+  clearTimeout(monitorTimer);
+  monitorTimer = setTimeout(async () => {
+    try { await refreshStatus(); }
+    catch {
+      connected = false;
+      connection('Нет связи со страницей', 'Нажмите ↗, чтобы открыть архив и подключиться снова.', 'error');
+      render();
+    }
+    if (connected) startMonitoring();
+  }, 650);
 }
 
-button.addEventListener('click', async () => {
-  message.classList.remove('error');
-
-  let singleOrder = { orderNumber: '', orderUrl: '' };
+async function connectToOrders() {
+  if (connecting) return;
+  connecting = true; connected = false;
+  clearTimeout(monitorTimer);
+  connection('Открываем архив заказов', 'Ищем открытую вкладку или создаём новую…');
+  render();
   try {
-    singleOrder = normalizeSpecificOrder(specificOrder.value);
-  } catch (error) {
-    message.classList.add('error');
-    message.textContent = error.message;
-    return;
-  }
-
-  if (!singleOrder.orderNumber && dateFrom.value && dateTo.value && dateFrom.value > dateTo.value) {
-    message.classList.add('error');
-    message.textContent = 'Дата «от» не может быть позже даты «до».';
-    return;
-  }
-
-  message.textContent = singleOrder.orderNumber
-    ? `Запускаю выгрузку заказа ${singleOrder.orderNumber}…`
-    : 'Запускаю выгрузку…';
-  setRunningUi(true);
-
-  try {
-    await saveSettings();
-    const tab = await getActiveOzonTab();
-    const response = await chrome.tabs.sendMessage(tab.id, {
-      type: 'OZON_EXPORT_ORDERS',
-      options: {
-        dateFrom: singleOrder.orderNumber ? '' : dateFrom.value,
-        dateTo: singleOrder.orderNumber ? '' : dateTo.value,
-        autoScroll: singleOrder.orderNumber ? false : autoScroll.checked,
-        specificOrder: singleOrder.orderNumber,
-        specificOrderUrl: singleOrder.orderUrl,
-        showTabs: showTabs.checked,
-        includeReturned: includeReturned.checked,
-        useCache: useCache.checked
+    const currentWindow = await chrome.windows.getCurrent();
+    const result = await chrome.runtime.sendMessage({ type: 'OZON_ENSURE_ORDERS_TAB', windowId: currentWindow.id });
+    if (!result?.ok) throw new Error(result?.error || 'Не удалось открыть архив заказов.');
+    sourceTabId = result.tabId;
+    let reloaded = false;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const tab = await chrome.tabs.get(sourceTabId);
+      if (tab.status === 'complete') {
+        try { await refreshStatus(); break; }
+        catch (error) {
+          const url = OzonSecurity.ozonUrl(tab.url);
+          if (!url || !/^\/my\/orderlist\/?$/.test(url.pathname)) throw error;
+          if (!reloaded && attempt >= 2) { await chrome.tabs.reload(sourceTabId); reloaded = true; }
+        }
       }
-    });
-
-    if (!response?.ok) throw new Error(response?.error || 'Не удалось запустить экспорт');
-    message.textContent = singleOrder.orderNumber
-      ? `Экспорт заказа ${singleOrder.orderNumber} запущен.`
-      : 'Экспорт запущен. Не закрывайте вкладку со списком заказов до завершения.';
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    }
+    if (!connected) throw new Error('Ozon ещё загружается. Войдите в аккаунт, если нужно, и нажмите ↗ для повторного подключения.');
+    notify();
     startMonitoring();
   } catch (error) {
-    message.classList.add('error');
-    message.textContent = error.message;
-    setRunningUi(false);
-  }
-});
+    connected = false;
+    connection('Нужно подключиться к Ozon', 'Нажмите ↗, чтобы попробовать снова.', 'error');
+    notify(error.message, true);
+  } finally { connecting = false; render(); }
+}
 
-stopButton.addEventListener('click', async () => {
-  if (stopButton.dataset.mode === 'exit') {
-    window.close();
-    return;
-  }
+async function refreshCacheInfo() {
+  const stored = await chrome.storage.local.get(null);
+  cacheEntries = Object.entries(stored).filter(([key, value]) => key.startsWith(CACHE_PREFIX) && value?.detail?.products?.length);
+  const products = cacheEntries.reduce((total, [, item]) => total + item.detail.products.length, 0);
+  $('cacheInfo').textContent = cacheEntries.length ? `В кэше: ${cacheEntries.length} заказов · ${products} товарных позиций` : 'Кэш пуст. История покупок не сохранена.';
+  render();
+}
 
+async function exportOrders(event) {
+  event.preventDefault();
+  if (starting || state.running || !connected) return;
+  notify();
+  for (const id of ['dateFrom', 'dateTo', 'specificOrder']) $(id).removeAttribute('aria-invalid');
   try {
-    const tab = await getActiveOzonTab();
-    await chrome.tabs.sendMessage(tab.id, { type: 'OZON_STOP_EXPORT' });
-    message.classList.remove('error');
-    message.textContent = 'Останавливаю выгрузку…';
-    stopButton.disabled = true;
-    for (let attempt = 0; attempt < 12; attempt += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 250));
-      const status = await chrome.tabs.sendMessage(tab.id, { type: 'OZON_EXPORT_STATUS' });
-      if (!status?.running) {
-        setRunningUi(false, status?.lastMessage || 'Выгрузка остановлена. CSV не создан.');
-        return;
-      }
+    if (mode === 'period') applyPreset();
+    const single = mode === 'order' ? OzonUi.normalizeSpecificOrder($('specificOrder').value) : { orderNumber: '', orderUrl: '' };
+    if (mode === 'order' && !single.orderNumber) {
+      $('specificOrder').setAttribute('aria-invalid', 'true'); $('specificOrder').focus();
+      throw new Error('Укажите номер заказа или вставьте ссылку на него.');
     }
-    message.textContent = 'Команда остановки отправлена.';
-  } catch (error) {
-    message.classList.add('error');
-    message.textContent = error.message;
-    setRunningUi(false);
-  }
-});
+    if (mode === 'period' && ((!OzonUi.validDate($('dateFrom').value) && selectedPreset !== 'all') ||
+        !OzonUi.validDate($('dateTo').value) || $('dateFrom').value > $('dateTo').value)) {
+      $('dateFrom').setAttribute('aria-invalid', 'true'); $('dateFrom').focus();
+      throw new Error('Проверьте даты: начало периода должно быть не позже окончания.');
+    }
+    starting = true; render();
+    await saveSettings();
+    await refreshStatus();
+    if (state.running) return;
+    const response = await chrome.tabs.sendMessage(sourceTabId, {
+      type: 'OZON_EXPORT_ORDERS', options: {
+        dateFrom: single.orderNumber ? '' : $('dateFrom').value, dateTo: single.orderNumber ? '' : $('dateTo').value,
+        autoScroll: !single.orderNumber && $('autoScroll').checked,
+        specificOrder: single.orderNumber, specificOrderUrl: single.orderUrl,
+        showTabs: $('showTabs').checked, includeReturned: $('includeReturned').checked, useCache: $('useCache').checked,
+      },
+    });
+    if (!response?.ok) throw new Error(response?.error || 'Не удалось запустить выгрузку.');
+    await refreshStatus();
+    startMonitoring();
+  } catch (error) { notify(error.message, true); }
+  finally { starting = false; render(); }
+}
 
-refreshStatus().then((running) => {
-  if (running) startMonitoring();
+$('exportForm').addEventListener('submit', exportOrders);
+$('openOrders').addEventListener('click', async () => {
+  if (state.running && sourceTabId && connected) await chrome.tabs.update(sourceTabId, { active: true }).catch(() => connectToOrders());
+  else await connectToOrders();
 });
+for (const name of ['period', 'order']) $(name + 'Mode').addEventListener('click', () => {
+  mode = name; notify(); renderSettings(); if (name === 'order') $('specificOrder').focus();
+});
+for (const button of document.querySelectorAll('[data-preset]')) button.addEventListener('click', () => {
+  selectedPreset = button.dataset.preset; applyPreset(); notify(); saveSettings().catch((error) => notify(error.message, true));
+});
+$('presetYear').addEventListener('change', () => { applyPreset(); saveSettings().catch((error) => notify(error.message, true)); });
+for (const id of ['dateFrom', 'dateTo']) $(id).addEventListener('change', () => {
+  selectedPreset = 'custom'; renderSettings(); saveSettings().catch((error) => notify(error.message, true));
+});
+for (const id of ['autoScroll', 'includeReturned', 'showTabs', 'useCache']) $(id).addEventListener('change', () => saveSettings().catch((error) => notify(error.message, true)));
+$('stopButton').addEventListener('click', async () => {
+  $('stopButton').disabled = true;
+  try { await chrome.tabs.sendMessage(sourceTabId, { type: 'OZON_STOP_EXPORT' }); await refreshStatus(); }
+  catch (error) { notify(error.message, true); render(); }
+});
+for (const [id, download] of [['savePartial', true], ['discardPartial', false]]) $(id).addEventListener('click', async () => {
+  $('savePartial').disabled = true; $('discardPartial').disabled = true;
+  try {
+    const response = await chrome.tabs.sendMessage(sourceTabId, { type: 'OZON_PARTIAL_EXPORT_DECISION', download });
+    if (!response?.ok) throw new Error(response?.error || 'Не удалось завершить выгрузку.');
+    await refreshStatus();
+  } catch (error) { notify(error.message, true); }
+  finally { $('savePartial').disabled = false; $('discardPartial').disabled = false; }
+});
+$('clearCache').addEventListener('click', async () => {
+  if (!cacheEntries.length || !confirm(`Удалить ${cacheEntries.length} заказов из кэша? Скачанные файлы и настройки останутся.`)) return;
+  try { await chrome.storage.local.remove(cacheEntries.map(([key]) => key)); await refreshCacheInfo(); notify('Кэш удалён.'); }
+  catch (error) { notify(error.message, true); }
+});
+$('downloadCache').addEventListener('click', async () => {
+  try {
+    await refreshCacheInfo();
+    if (!cacheEntries.length) return;
+    const payload = { format: 'OzonMyOrders2csv order cache', cacheSchema: 4,
+      extensionVersion: chrome.runtime.getManifest().version, exportedAt: new Date().toISOString(),
+      orders: cacheEntries.map(([key, entry]) => ({ cacheKey: key, ...entry })) };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader(); reader.onload = () => resolve(reader.result); reader.onerror = () => reject(new Error('Не удалось подготовить файл.')); reader.readAsDataURL(blob);
+    });
+    const response = await chrome.runtime.sendMessage({ type: 'OZON_DOWNLOAD_DATA_URL', dataUrl,
+      filename: `ozon_order_cache_${OzonUi.localIsoDate()}_v${chrome.runtime.getManifest().version}.json` });
+    if (!response?.ok) throw new Error(response?.error || 'Не удалось сохранить файл.');
+    notify('Копия кэша сохранена.');
+  } catch (error) { notify(error.message, true); }
+});
+window.addEventListener('focus', () => { if (!state.running && settingsReady) applyPreset(); });
+window.addEventListener('pagehide', () => clearTimeout(monitorTimer));
+async function initialize() {
+  try { await restoreSettings(); await refreshCacheInfo(); }
+  catch (error) { settingsReady = true; applyPreset(); notify(`Не удалось прочитать настройки: ${error.message}`, true); }
+  await connectToOrders();
+}
+initialize();
