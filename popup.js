@@ -192,8 +192,8 @@ function normalizeSpecificOrder(value) {
   }
 
   try {
-    const url = new URL(raw);
-    if (!/(^|\.)ozon\.ru$/i.test(url.hostname)) throw new Error('not_ozon');
+    const url = OzonSecurity.orderUrl(raw);
+    if (!url) throw new Error('not_ozon');
     const orderNumber = url.searchParams.get('order') || url.searchParams.get('orderNumber') ||
       url.searchParams.get('orderId') || url.pathname.match(/\/orderdetails\/(\d[\d-]{5,})/i)?.[1] || '';
     if (!orderNumber || !/^[\d-]{6,}$/.test(orderNumber)) throw new Error('no_order');
@@ -208,7 +208,7 @@ function normalizeSpecificOrder(value) {
 
 async function getActiveOzonTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab?.id || !/^https:\/\/(www\.)?ozon\.ru\//i.test(tab.url || '')) {
+  if (!tab?.id || !OzonSecurity.ozonUrl(tab.url)) {
     throw new Error('Сначала откройте любую страницу ozon.ru');
   }
   return tab;

@@ -66,10 +66,10 @@
           </span>
         </label>
         <label class="check observer-option cache-option">
-          <input id="useCache" type="checkbox" checked>
+          <input id="useCache" type="checkbox">
           <span class="check-copy">
-            Использовать кэш
-            <span class="field-note">Если снять — обновить кэш выбранного периода. Остальные заказы сохраняются.</span>
+            Использовать и сохранять кэш
+            <span class="field-note">Если снять — заказы не читаются из кэша и не сохраняются. Старый кэш удаляется кнопкой «Очистить».</span>
           </span>
         </label>
 
@@ -89,8 +89,9 @@
       <button id="stopButton" class="stop" type="button">Стоп</button>
     </div>
     <p id="message" class="message" aria-live="polite"></p>
-    <p class="privacy">Файл создаётся локально; данные аккаунта никуда не отправляются.</p>
+    <p class="privacy">Файл создаётся локально. При включённом кэше история покупок сохраняется в этом профиле Chrome.</p>
   </main>
+  <script src="security.js"></script>
   <script src="popup.js"></script>
 </body>
 </html>

@@ -215,8 +215,8 @@
     }
 
     try {
-      const parsed = new URL(raw, location.origin);
-      if (!/(^|\.)ozon\.ru$/i.test(parsed.hostname)) return { orderNumber: '', orderUrl: '' };
+      const parsed = OzonSecurity.orderUrl(raw, location.origin);
+      if (!parsed) return { orderNumber: '', orderUrl: '' };
       const orderNumber = parsed.searchParams.get('order') || parsed.searchParams.get('orderNumber') ||
         parsed.searchParams.get('orderId') || parsed.pathname.match(/\/orderdetails\/(\d[\d-]{5,})/i)?.[1] || '';
       if (!/^[\d-]{6,}$/.test(orderNumber)) return { orderNumber: '', orderUrl: '' };
@@ -262,7 +262,7 @@
       }
 
       const url = base['Ссылка на заказ'];
-      let detail = options.useCache === false ? null : await readCachedOrder(base);
+      let detail = options.useCache === true ? await readCachedOrder(base) : null;
       const fromCache = Boolean(detail);
       if (fromCache) {
         cacheHits += 1;
@@ -271,7 +271,7 @@
           orderUrl: url
         });
       } else {
-        if (options.useCache === false) {
+        if (options.useCache !== true) {
           addDiagnostic('info', 'Кэш пропущен по настройке — заказ перечитывается', {
             orderNumber: base['Номер заказа'],
             orderUrl: url
@@ -395,6 +395,7 @@
   }
 
   async function writeCachedOrder(base, detail, options = {}) {
+    if (options.useCache !== true) return false;
     // Only a confirmed order date may authorize overwriting cache within a period.
     const orderDate = detail?.orderDate || '';
     if ((options.dateFrom || options.dateTo) && !orderDate) return false;
@@ -427,6 +428,12 @@
   }
 
   async function fetchOrderDetail(orderUrl, options) {
+    const safeUrl = OzonSecurity.orderUrl(orderUrl, location.origin);
+    if (!safeUrl) {
+      addDiagnostic('warning', 'Заблокирована недопустимая ссылка на заказ');
+      return null;
+    }
+    orderUrl = safeUrl.href;
     try {
       const rendered = await chrome.runtime.sendMessage({
         type: 'OZON_PARSE_DETAIL_IN_TAB',
@@ -496,12 +503,15 @@
   }
 
   async function fetchWithStop(url, options) {
+    const safeUrl = OzonSecurity.ozonUrl(url, location.origin);
+    if (!safeUrl) throw new Error('Заблокирован запрос за пределы HTTPS-доменов Ozon');
     const controller = new AbortController();
     activeControllers.add(controller);
     if (stopRequested) controller.abort();
     const timeout = setTimeout(() => controller.abort(), 15000);
     try {
-      return await fetch(url, { ...options, signal: controller.signal });
+      // Fail closed: do not follow a redirect to an unchecked destination.
+      return await fetch(safeUrl.href, { ...options, redirect: 'error', signal: controller.signal });
     } finally {
       clearTimeout(timeout);
       activeControllers.delete(controller);
@@ -646,10 +656,11 @@
     });
     if (!control) return '';
     const href = control.closest('a[href]')?.getAttribute('href') || control.getAttribute('href') || '';
-    if (href) return absoluteUrl(href);
+    if (href) return OzonSecurity.returnUrl(href, location.origin)?.href || '';
     const current = doc.location?.href || location.href;
     try {
-      const parsed = new URL(current);
+      const parsed = OzonSecurity.orderUrl(current);
+      if (!parsed) return '';
       const orderNumber = parsed.searchParams.get('order') || parsed.searchParams.get('orderNumber') ||
         clean(doc.body?.textContent).match(/(?:№|заказ\s*№?)\s*([\d-]{6,})/i)?.[1] || '';
       return orderNumber
@@ -1197,7 +1208,7 @@
 
   function isOrderLink(anchor) {
     const href = anchor.getAttribute('href') || '';
-    return /\/my\/order(?:details|list\/)?/i.test(href) && !/\/my\/orderlist\/?$/i.test(href);
+    return Boolean(OzonSecurity.orderUrl(href, location.origin));
   }
 
   function findOrderCard(anchor) {
@@ -1461,7 +1472,7 @@
       ['Дата до', singleOrderMode ? 'не применяется' : (options.dateTo || 'не указана')],
       ['Автозагрузка истории', singleOrderMode ? 'Нет — конкретный заказ' : (options.autoScroll ? 'Да' : 'Нет')],
       ['Режим вкладок', options.showTabs ? 'Активные, по одной' : 'Неактивные, до двух'],
-      ['Использовать кэш', options.useCache === false ? 'Нет — перечитать и обновить' : 'Да'],
+      ['Использовать и сохранять кэш', options.useCache === true ? 'Да' : 'Нет — без чтения и записи заказов'],
       ['Включать товары с возвратом', options.includeReturned ? 'Да' : 'Нет'],
       ['Заказов в результате', summary.orders ?? ''],
       ['Строк товаров', summary.rows ?? rows.length],
@@ -1507,7 +1518,14 @@
   }
 
   function csvCell(value) {
-    const string = String(value ?? '');
+    let string = String(value ?? '');
+    // Excel text prefix inside the quoted field. Inspect past whitespace and
+    // invisible controls, including full-width formula markers used in some locales.
+    const start = string.replace(/^[\s\p{Cc}\p{Cf}]+/u, '');
+    if (!(typeof value === 'number' && Number.isFinite(value)) &&
+        (/^[=+\-@＝＋－＠]/u.test(start) || /^[\t\r\n]/.test(string))) {
+      string = '\t' + string;
+    }
     return `"${string.replace(/"/g, '""')}"`;
   }
 
@@ -1548,7 +1566,7 @@
         specificOrder: options.specificOrder || '',
         specificOrderUrl: options.specificOrderUrl || '',
         showTabs: Boolean(options.showTabs),
-        useCache: options.useCache !== false,
+        useCache: options.useCache === true,
         includeReturned: Boolean(options.includeReturned)
       },
       orders: [],
@@ -1724,7 +1742,7 @@
   }
 
   function absoluteUrl(href) {
-    try { return new URL(href, location.origin).href; } catch { return href || ''; }
+    return OzonSecurity.ozonUrl(href, location.origin)?.href || '';
   }
 
   function clean(value) {

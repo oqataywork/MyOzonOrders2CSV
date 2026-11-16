@@ -1,3 +1,5 @@
+importScripts('security.js');
+
 const detailTabs = new Set();
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -24,11 +26,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 async function parseDetailInTab(url, options, sourceTabId) {
+  const safeOrderUrl = OzonSecurity.orderUrl(url);
+  if (!safeOrderUrl) throw new Error('Заблокирована ссылка: требуется HTTPS-страница заказа на ozon.ru или www.ozon.ru');
   const showTabs = Boolean(options.showTabs);
-  const tab = await chrome.tabs.create({ url, active: showTabs });
+  const tab = await chrome.tabs.create({ url: safeOrderUrl.href, active: showTabs });
   detailTabs.add(tab.id);
   try {
     await waitForComplete(tab.id, 20000);
+    await assertTabUrl(tab.id, OzonSecurity.orderUrl);
     let lastDetail = null;
     for (let attempt = 0; attempt < 12; attempt += 1) {
       await wait(attempt === 0 ? 1200 : 500);
@@ -65,8 +70,11 @@ async function parseDetailInTab(url, options, sourceTabId) {
     }
 
     try {
-      await chrome.tabs.update(tab.id, { url: lastDetail.returnUrl });
+      const safeReturnUrl = OzonSecurity.returnUrl(lastDetail.returnUrl, safeOrderUrl.href);
+      if (!safeReturnUrl) throw new Error('Заблокирована недопустимая ссылка на страницу возврата');
+      await chrome.tabs.update(tab.id, { url: safeReturnUrl.href });
       await waitForComplete(tab.id, 20000);
+      await assertTabUrl(tab.id, OzonSecurity.returnUrl);
       let returnCheck = null;
       for (let attempt = 0; attempt < 12; attempt += 1) {
         await wait(attempt === 0 ? 1200 : 500);
@@ -124,6 +132,11 @@ async function parseDetailInTab(url, options, sourceTabId) {
       await chrome.tabs.update(sourceTabId, { active: true }).catch(() => {});
     }
   }
+}
+
+async function assertTabUrl(tabId, validate) {
+  const tab = await chrome.tabs.get(tabId);
+  if (!validate(tab.url)) throw new Error('Вкладка перешла на недопустимую страницу');
 }
 
 function waitForComplete(tabId, timeoutMs) {

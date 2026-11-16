@@ -1,0 +1,6 @@
+dist/
+node_modules/
+.codebase-memory/
+*.csv
+ozon_export_report_*.json
+ozon_order_cache_*.json
